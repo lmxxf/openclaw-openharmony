@@ -1,0 +1,14 @@
+# Node.js source tree (2GB+, download from nodejs.org)
+sources/node-v22.22.1/
+sources/node-v22.22.1.tar.gz
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# temp files on Windows side
+/mnt/c/Users/*/node-ohos-tmp
+/mnt/c/Users/*/test_*

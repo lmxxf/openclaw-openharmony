@@ -161,4 +161,132 @@ libvips（C，图片处理核心）
 
 *OH 工程路径: `/home/lmxxf/oh6/source`*
 *上次项目: `/home/lmxxf/work/langchain-on-openharmony/`（Python 移植，可复用 OpenSSL/zlib 经验）*
-*编译器 wrapper: 上次项目的 `LangChain/build/ohos-cc.sh` / `ohos-cxx.sh` 可直接复用*
+*编译器 wrapper: `scripts/ohos-cc.sh` / `scripts/ohos-cxx.sh`*
+
+---
+
+## 2026-03-15 实战：Node.js 22 交叉编译
+
+### 编译环境
+
+| 组件 | 版本/路径 |
+|------|-----------|
+| Node.js 源码 | 22.22.1（`sources/node-v22.22.1/`） |
+| OH Clang | 15.0.4（`prebuilts/clang/ohos/linux-x86_64/llvm/`） |
+| CC wrapper | `scripts/ohos-cc.sh`（`--target=aarch64-unknown-linux-ohos --sysroot=...`） |
+| CXX wrapper | `scripts/ohos-cxx.sh` |
+
+### 关键发现
+
+**Node.js 官方已支持 OpenHarmony 作为 `--dest-os`！** configure.py 第 49 行：`'openharmony'` 是 valid_os 之一。代码里大量 `OS=="openharmony"` 条件分支，不需要 hack。
+
+### configure 命令
+
+```bash
+CC_host=gcc CXX_host=g++ \
+CC=scripts/ohos-cc.sh \
+CXX=scripts/ohos-cxx.sh \
+AR=<llvm>/llvm-ar \
+RANLIB=<llvm>/llvm-ranlib \
+python3 configure.py \
+  --dest-cpu=arm64 \
+  --dest-os=openharmony \
+  --cross-compiling \
+  --prefix=build/node-ohos
+```
+
+### 踩坑记录
+
+| 坑 | 原因 | 解法 |
+|---|---|---|
+| `auto` not allowed in function prototype | ncrypto.h 用了 C++20 `auto` 函数参数，但 common.gypi 设的 `-std=gnu++17` | 改 common.gypi 第 514 行：`gnu++17` → `gnu++20` |
+| `operator<=>` 三路比较运算符 | ncrypto.cc 用了 C++20 `<=>` | 同上，改为 C++20 一并解决 |
+| Clang 15 崩溃 `CannotYetSelect` 编译 zlib `crc32_simd.c` | zlib.gyp 里 `zlib_arm_crc32` target 只在 `clang==0`（非 clang）时加 `-march=armv8-a+aes+crc`，clang 编译时缺 CRC32 指令支持 | 改 zlib.gyp 第 72 行条件：`OS!="win" and clang==0` → `OS!="win"`（clang 也加 `-march`） |
+
+### 编译产物
+
+| 产物 | 大小 | 说明 |
+|------|------|------|
+| `out/Release/node` | 117MB（未 strip） | ELF 64-bit ARM aarch64，动态链接 |
+| `build/node-ohos` | **93MB**（strip 后） | 部署用 |
+
+### 动态依赖
+
+```
+libc++.so   — OH 系统自带
+libc.so     — OH 系统自带（musl）
+```
+
+**V8、OpenSSL 3.x、libuv、zlib、brotli、zstd、sqlite、ICU、nghttp2 全部静态链入。** 只依赖 OH 系统库。
+
+### interpreter 路径问题
+
+二进制 interpreter 是 `/lib/ld-musl-aarch64.so.1`，但 OH 板子上动态链接器在 `/system/lib/ld-musl-aarch64.so.1`。
+
+**解法选项：**
+1. 板子上创建软链：`ln -s /system/lib/ld-musl-aarch64.so.1 /lib/ld-musl-aarch64.so.1`
+2. patchelf 改 interpreter 路径
+3. 直接用 `LD_LIBRARY_PATH` + 绝对路径调用（上次 Python 的经验）
+
+### patch 记录
+
+改了两个文件（相对于 Node.js 22.22.1 原版）：
+
+1. **`common.gypi` 第 514 行**：`-std=gnu++17` → `-std=gnu++20`
+2. **`deps/zlib/zlib.gyp` 第 72 行**：`'OS!="win" and clang==0'` → `'OS!="win"'`
+
+### 板子验证通过 ✅
+
+```
+$ LD_LIBRARY_PATH=/system/lib64 /data/local/tmp/node /data/local/tmp/test_node.js
+
+Platform: openharmony
+Arch: arm64
+Version: v22.22.1
+V8: 12.4.254.21-node.35
+OpenSSL: 3.5.5
+crypto OK, random: 03c77e1c
+net OK
+https OK
+
+=== Node.js on OpenHarmony: ALL OK ===
+```
+
+**`process.platform` = `openharmony`** ——Node.js 官方 OH 支持，不是 hack。
+
+### 踩坑：libc++.so 路径
+
+| 问题 | 原因 | 解法 |
+|---|---|---|
+| SIGBUS（Signal 7） | 从 SDK 推的 libc++.so 与板子 musl 不兼容 | 用板子系统自带的 `/system/lib64/libc++.so` |
+| 上次 Python 二进制也 SIGBUS | 板子上 `/data/local/tmp/lib/libc++.so` 被本次推的坏文件覆盖 | 删掉，用系统 lib64 |
+| hdc 第一次传输 MD5 不一致 | USB 线质量问题 | 换线，验证 MD5 |
+
+**运行命令模板：**
+```bash
+LD_LIBRARY_PATH=/system/lib64 /data/local/tmp/node xxx.js
+```
+
+### 下一步
+
+- [x] Node.js 22.22.1 交叉编译成功
+- [x] 推板子验证 `node --version` ✅
+- [x] 验证 crypto / net / https ✅
+- [ ] 交叉编译 native addon（sharp 等）
+- [ ] 部署 OpenClaw
+
+### 文件结构
+
+```
+/home/lmxxf/work/openclaw-openharmony/
+├── sources/
+│   ├── openclaw/                    # git submodule（原版源码）
+│   ├── node-v22.22.1/               # Node.js 源码（含 patch）
+│   └── node-v22.22.1.tar.gz         # 源码包
+├── build/
+│   └── node-ohos                    # 93MB strip 后的 node 二进制
+├── scripts/
+│   ├── ohos-cc.sh                   # C 编译器 wrapper
+│   └── ohos-cxx.sh                  # C++ 编译器 wrapper
+└── DevHistory.md
+```

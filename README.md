@@ -2,6 +2,8 @@
 
 在 OpenHarmony 开发板上跑 Node.js 22 + OpenClaw（264k star AI Agent 框架）+ DeepSeek 大模型对话。全链路已验证打通。
 
+![OpenClaw Control UI running on OpenHarmony — native OpenClaw v2026.3.14 with DeepSeek chat](assets/openclaw-chat.png)
+
 ```
 OH RK3568 → Node.js 22.22.1 (V8 12.4 + OpenSSL 3.5.5)
     → OpenClaw 2026.3.14 Gateway

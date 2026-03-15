@@ -272,8 +272,167 @@ LD_LIBRARY_PATH=/system/lib64 /data/local/tmp/node xxx.js
 - [x] Node.js 22.22.1 交叉编译成功
 - [x] 推板子验证 `node --version` ✅
 - [x] 验证 crypto / net / https ✅
+- [x] OpenClaw CLI 在板子上跑通 ✅
 - [ ] 交叉编译 native addon（sharp 等）
-- [ ] 部署 OpenClaw
+- [ ] OpenClaw gateway 功能验证
+
+---
+
+## 2026-03-15 OpenClaw 部署打通
+
+### 构建策略
+
+OpenClaw 是 TypeScript 项目，`pnpm build:docker` 在**宿主机**上把 TS 编译成 JS（`dist/`），然后把 `dist/` + `node_modules/`（运行时依赖）一起打包推到板子上。
+
+```
+宿主机：pnpm install → pnpm build:docker → dist/ + node_modules/
+    ↓ tar + hdc
+板子：node openclaw.mjs
+```
+
+### 构建过程
+
+```bash
+cd sources/openclaw
+pnpm install                           # 39 秒
+OPENCLAW_A2UI_SKIP_MISSING=1 pnpm build:docker  # 跳过 Canvas A2UI（板子不需要 UI 渲染）
+```
+
+### 部署包精简
+
+`pnpm deploy --prod --legacy` 打出生产依赖，然后删掉 x86 native addon（板子是 aarch64 用不了）：
+
+| 删除项 | 大小 | 原因 |
+|---|---|---|
+| @node-llama-cpp/linux-x64-* | 685MB | 本地 LLM，可选，x86 prebuilt |
+| koffi | 85MB | FFI，x86 prebuilt |
+| @napi-rs/canvas-linux-x64-* | 32MB | Canvas，x86 prebuilt |
+| pdfjs-dist | 40MB | PDF 解析，暂不需要 |
+| typescript | 23MB | 运行时不需要 |
+| @img/sharp-libvips-linux-x64 | 16MB | 图片处理，x86 prebuilt |
+
+精简后 node_modules 从 1.3GB → 378MB，加上 dist/ 66MB，tar.gz 最终 **58MB**。
+
+### 板子验证通过 ✅
+
+```
+$ LD_LIBRARY_PATH=/system/lib64 /data/local/tmp/node /data/local/tmp/openclaw/openclaw.mjs --version
+OpenClaw 2026.3.14 (8db6fcc)
+
+$ LD_LIBRARY_PATH=/system/lib64 /data/local/tmp/node /data/local/tmp/openclaw/openclaw.mjs --help
+🦞 OpenClaw 2026.3.14 (8db6fcc) — I don't sleep, I just enter low-power mode and dream of clean diffs.
+Usage: openclaw [options] [command]
+... （完整 CLI 输出）
+```
+
+### 部署结构
+
+```
+/data/local/tmp/
+├── node                    # 93MB Node.js 22.22.1
+└── openclaw/
+    ├── openclaw.mjs        # 入口
+    ├── package.json
+    ├── dist/               # 66MB 构建产物（JS）
+    └── node_modules/       # 378MB 运行时依赖
+```
+
+### 运行命令
+
+```bash
+LD_LIBRARY_PATH=/system/lib64 /data/local/tmp/node /data/local/tmp/openclaw/openclaw.mjs [command]
+```
+
+---
+
+## 2026-03-15 OpenClaw Gateway + Control UI + DeepSeek 全链路打通 🔥
+
+### Gateway 启动
+
+```bash
+HOME=/data/local/tmp LD_LIBRARY_PATH=/system/lib64 \
+/data/local/tmp/node /data/local/tmp/openclaw/openclaw.mjs \
+gateway run --bind lan --port 18800 --force
+```
+
+### Control UI
+
+需要先在宿主机上编 UI 资源：
+
+```bash
+cd sources/openclaw
+pnpm ui:build    # 产物在 dist/control-ui/
+```
+
+然后把 `dist/control-ui/` 推到板子的 `openclaw/dist/control-ui/`。
+
+端口转发到宿主机：`hdc fport tcp:18800 tcp:18800`
+
+浏览器访问：`http://localhost:18800/#token=<gateway-token>`
+
+### DeepSeek API 配置
+
+最终正确的 `openclaw.json`（关键部分）：
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": { "primary": "custom/deepseek-chat" }
+    }
+  },
+  "models": {
+    "providers": {
+      "custom": {
+        "baseUrl": "https://api.deepseek.com/v1",
+        "apiKey": "sk-xxx",
+        "models": [
+          {
+            "id": "deepseek-chat",
+            "name": "DeepSeek Chat",
+            "api": "openai-completions",
+            "contextWindow": 65536,
+            "maxTokens": 8192
+          }
+        ]
+      }
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "controlUi": { "dangerouslyAllowHostHeaderOriginFallback": true },
+    "auth": { "mode": "token", "token": "xxx" }
+  }
+}
+```
+
+### 踩坑记录（DeepSeek 配置）
+
+| 坑 | 原因 | 解法 |
+|---|---|---|
+| `Unknown model: deepseek/deepseek-chat` | 顶层 `providers` 字段不对 | 正确路径是 `models.providers.custom` |
+| Config validation: `expected array, received object` | `models` 字段写成了对象 | `models` 是数组：`[{id, name, ...}]` |
+| `404 status code (no body)` | 默认用 `openai-responses` API，DeepSeek 不支持 | 显式指定 `"api": "openai-completions"` |
+| `Control UI requires secure context` | 非 localhost 访问需要 HTTPS | `hdc fport` 端口转发到 localhost |
+| `unauthorized: gateway token missing` | Control UI 需要 auth token | URL hash 传 token：`#token=xxx` |
+| `Missing workspace template: AGENTS.md` | 部署包没打进 docs/reference/templates/ | 补推模板文件 |
+| gateway 后台进程被杀 | hdc shell 退出后子进程被 OH 回收 | 保持 hdc shell 前台运行 |
+
+### 额外补推的文件
+
+| 文件 | 原因 |
+|---|---|
+| `dist/control-ui/` | `pnpm ui:build` 产物，Gateway Web 界面 |
+| `docs/reference/templates/` | Agent 模板文件，发消息时需要 |
+
+### 完成状态
+
+- [x] Node.js 22.22.1 交叉编译
+- [x] OpenClaw CLI 运行（--version, --help）
+- [x] Gateway 启动
+- [x] Control UI 网页访问
+- [x] DeepSeek API 对话
+- [x] **全链路：OH RK3568 → Node.js → OpenClaw Gateway → Control UI → DeepSeek Chat**
 
 ### 文件结构
 

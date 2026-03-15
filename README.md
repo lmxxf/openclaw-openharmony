@@ -1,93 +1,164 @@
 # OpenClaw on OpenHarmony 6.0 (RK3568, aarch64)
 
-在 OpenHarmony 开发板上跑 Node.js 22 + OpenClaw（264k star AI Agent 框架）。
+在 OpenHarmony 开发板上跑 Node.js 22 + OpenClaw（264k star AI Agent 框架）+ DeepSeek 大模型对话。全链路已验证打通。
 
 ```
 OH RK3568 → Node.js 22.22.1 (V8 12.4 + OpenSSL 3.5.5)
-    → process.platform = "openharmony"
-    → crypto / net / https OK
-    → OpenClaw（进行中）
+    → OpenClaw 2026.3.14 Gateway
+    → Control UI (网页聊天界面)
+    → DeepSeek API (openai-completions)
+    → AI 对话 ✅
 ```
 
 ## 快速部署（已有编译产物）
-
-2 条命令把 Node.js 22 跑在 OH 开发板上。
 
 ### 前提
 
 - 宿主机能通过 `hdc` 连接到 RK3568 开发板
 - 板子上有 `/data/local/tmp/`（14G+ 可用空间）
+- 宿主机有 Node.js 22+ 和 pnpm 10+（构建 OpenClaw 用）
 
 ### 步骤
 
 **1. 推 node 二进制到板子**
 
-`build/node-ohos`（93MB）是 strip 后的 Node.js 22.22.1 静态二进制（V8 + OpenSSL + libuv + ICU 全部静态链入，只依赖系统 libc.so 和 libc++.so）。
+`build/node-ohos`（93MB）是 strip 后的 Node.js 22.22.1（V8 + OpenSSL + libuv + ICU 全部静态链入，只依赖系统 libc.so 和 libc++.so）。
 
 ```bash
 hdc file send build/node-ohos /data/local/tmp/node
 hdc shell 'chmod +x /data/local/tmp/node'
 ```
 
-**2. 验证**
+**2. 构建 OpenClaw（在宿主机上）**
 
 ```bash
-hdc shell 'LD_LIBRARY_PATH=/system/lib64 /data/local/tmp/node --version'
-# 输出：v22.22.1
+cd sources/openclaw
+pnpm install
+OPENCLAW_A2UI_SKIP_MISSING=1 pnpm build:docker   # 编译 TS → JS
+pnpm ui:build                                      # 编译 Control UI
 ```
 
-完整验证脚本（保存为 `test_node.js`，推到板子上跑）：
-
-```javascript
-console.log('Platform:', process.platform);
-console.log('Arch:', process.arch);
-console.log('Version:', process.version);
-console.log('V8:', process.versions.v8);
-console.log('OpenSSL:', process.versions.openssl);
-
-const crypto = require('crypto');
-console.log('crypto OK, random:', crypto.randomBytes(4).toString('hex'));
-
-const net = require('net');
-console.log('net OK');
-
-const https = require('https');
-console.log('https OK');
-
-console.log('\n=== Node.js on OpenHarmony: ALL OK ===');
-```
+**3. 打包部署到板子**
 
 ```bash
-hdc file send test_node.js /data/local/tmp/test_node.js
-hdc shell 'LD_LIBRARY_PATH=/system/lib64 /data/local/tmp/node /data/local/tmp/test_node.js'
+# 创建生产部署包
+pnpm deploy --filter openclaw --prod --legacy /tmp/openclaw-deploy
+
+# 删除 x86 native addon（板子是 aarch64 用不了）
+cd /tmp/openclaw-deploy/node_modules/.pnpm
+rm -rf @node-llama-cpp+linux-x64-* node-llama-cpp@* \
+  @napi-rs+canvas-linux-x64-* @img+sharp-libvips-linux-x64* \
+  koffi@* typescript@* pdfjs-dist@*
+
+# 打包
+cd /tmp/openclaw-deploy
+tar czf openclaw-deploy.tar.gz \
+  --exclude='*.d.ts' --exclude='*.map' --exclude='*.md' \
+  --exclude='LICENSE*' --exclude='__tests__' --exclude='test' \
+  openclaw.mjs package.json dist/ node_modules/
+
+# 推到板子
+hdc file send openclaw-deploy.tar.gz /data/local/tmp/openclaw-deploy.tar.gz
+hdc shell 'mkdir -p /data/local/tmp/openclaw && cd /data/local/tmp/openclaw && tar xzf /data/local/tmp/openclaw-deploy.tar.gz && rm /data/local/tmp/openclaw-deploy.tar.gz'
 ```
 
-预期输出：
-
-```
-Platform: openharmony
-Arch: arm64
-Version: v22.22.1
-V8: 12.4.254.21-node.35
-OpenSSL: 3.5.5
-crypto OK, random: 03c77e1c
-net OK
-https OK
-
-=== Node.js on OpenHarmony: ALL OK ===
-```
-
-**3. 运行命令模板**
+**4. 补推模板文件（Agent 发消息需要）**
 
 ```bash
-LD_LIBRARY_PATH=/system/lib64 /data/local/tmp/node your_script.js
+cd sources/openclaw
+tar czf /tmp/openclaw-templates.tar.gz docs/reference/templates/
+hdc file send /tmp/openclaw-templates.tar.gz /data/local/tmp/openclaw-templates.tar.gz
+hdc shell 'cd /data/local/tmp/openclaw && tar xzf /data/local/tmp/openclaw-templates.tar.gz && rm /data/local/tmp/openclaw-templates.tar.gz'
 ```
 
-> **注意**：`LD_LIBRARY_PATH=/system/lib64` 是必须的——板子上 libc++.so 在 `/system/lib64/`，不在默认搜索路径里。
+**5. 配置 DeepSeek API**
+
+```bash
+# 设模型
+hdc shell 'HOME=/data/local/tmp LD_LIBRARY_PATH=/system/lib64 /data/local/tmp/node /data/local/tmp/openclaw/openclaw.mjs config set gateway.mode local'
+hdc shell 'HOME=/data/local/tmp LD_LIBRARY_PATH=/system/lib64 /data/local/tmp/node /data/local/tmp/openclaw/openclaw.mjs config set gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback true'
+hdc shell 'HOME=/data/local/tmp LD_LIBRARY_PATH=/system/lib64 /data/local/tmp/node /data/local/tmp/openclaw/openclaw.mjs models set custom/deepseek-chat'
+```
+
+然后手动写 config（`hdc shell` 进板子编辑 `/data/local/tmp/.openclaw/openclaw.json`），确保 `models.providers` 部分如下：
+
+```json
+{
+  "models": {
+    "providers": {
+      "custom": {
+        "baseUrl": "https://api.deepseek.com/v1",
+        "apiKey": "你的 DeepSeek API Key",
+        "models": [
+          {
+            "id": "deepseek-chat",
+            "name": "DeepSeek Chat",
+            "api": "openai-completions",
+            "contextWindow": 65536,
+            "maxTokens": 8192
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+> **关键**：`api` 必须设为 `"openai-completions"`。OpenClaw 默认用 OpenAI Responses API，DeepSeek 不支持，会返回 404。
+
+**6. 启动 Gateway**
+
+```bash
+hdc shell 'HOME=/data/local/tmp LD_LIBRARY_PATH=/system/lib64 /data/local/tmp/node /data/local/tmp/openclaw/openclaw.mjs gateway run --bind lan --port 18800 --force'
+```
+
+**7. 端口转发 + 打开网页**
+
+```bash
+hdc fport tcp:18800 tcp:18800
+```
+
+浏览器打开（token 从 `~/.openclaw/openclaw.json` 的 `gateway.auth.token` 字段获取）：
+
+```
+http://localhost:18800/#token=你的gateway-token
+```
+
+> 必须通过 `localhost` 访问——浏览器要求 secure context（HTTPS 或 localhost）才能使用 Control UI 的设备标识功能。
+
+**8. 验证**
+
+```bash
+# CLI 验证
+hdc shell 'LD_LIBRARY_PATH=/system/lib64 /data/local/tmp/node /data/local/tmp/openclaw/openclaw.mjs --version'
+# 输出：OpenClaw 2026.3.14 (8db6fcc)
+
+# 模型验证
+hdc shell 'HOME=/data/local/tmp LD_LIBRARY_PATH=/system/lib64 /data/local/tmp/node /data/local/tmp/openclaw/openclaw.mjs models list'
+# 输出：custom/deepseek-chat  text  64k  no  yes  default
+
+# 网页验证：在 Control UI 发消息，DeepSeek 回复
+```
+
+### 板子上的目录结构
+
+```
+/data/local/tmp/
+├── node                           # 93MB Node.js 22.22.1
+├── openclaw/
+│   ├── openclaw.mjs               # 入口
+│   ├── package.json
+│   ├── dist/                      # 66MB 构建产物（JS）
+│   │   └── control-ui/            # Gateway Web 界面
+│   ├── docs/reference/templates/  # Agent 模板文件
+│   └── node_modules/              # 378MB 运行时依赖（精简后）
+└── .openclaw/
+    └── openclaw.json              # 配置文件
+```
 
 ---
 
-## 从头编译
+## 从头编译 Node.js
 
 适用场景：没有编译产物，或想改 Node.js 版本。
 
@@ -212,13 +283,13 @@ hdc shell 'chmod +x /data/local/tmp/node && LD_LIBRARY_PATH=/system/lib64 /data/
 # 输出：v22.22.1
 ```
 
-然后按"快速部署"的步骤验证。
-
 ---
 
 ## 踩坑备忘
 
 详细排查过程见 [DevHistory.md](DevHistory.md)。
+
+### Node.js 交叉编译
 
 | 坑 | 根因 | 修法 |
 |:---|:---|:---|
@@ -229,20 +300,17 @@ hdc shell 'chmod +x /data/local/tmp/node && LD_LIBRARY_PATH=/system/lib64 /data/
 | hdc 传输文件 MD5 不一致 | USB 线质量差 | 换线，传后验证 MD5 |
 | libc++.so 找不到 | OH 的 C++ 运行时在 `/system/lib64/` 不在 `/system/lib/` | `LD_LIBRARY_PATH=/system/lib64` |
 
-## 编译产物
+### OpenClaw 部署
 
-| 产物 | 大小 | 说明 |
+| 坑 | 根因 | 修法 |
 |:---|:---|:---|
-| `build/node-ohos` | 93MB | Node.js 22.22.1，strip 后 |
-
-动态依赖（均为 OH 系统自带）：
-
-```
-libc++.so    → /system/lib64/libc++.so
-libc.so      → /system/lib/ld-musl-aarch64.so.1
-```
-
-V8、OpenSSL 3.5.5、libuv、zlib、brotli、zstd、sqlite、ICU、nghttp2、simdjson、simdutf 等全部静态链入。
+| `Missing workspace template: AGENTS.md` | 部署包没打进 docs/reference/templates/ | 补推模板文件 |
+| `Control UI requires secure context` | 非 localhost 需要 HTTPS | `hdc fport` 端口转发到 localhost |
+| `unauthorized: gateway token missing` | Control UI 需要 auth token | URL hash 传 token：`#token=xxx` |
+| `Unknown model: deepseek/deepseek-chat` | `providers` 放在顶层而非 `models.providers` | 正确路径：`models.providers.custom` |
+| Config: `expected array, received object` | `models` 字段写成了对象 | `models` 是数组：`[{id, name, ...}]` |
+| `404 status code (no body)` | 默认用 `openai-responses` API，DeepSeek 不支持 | 显式指定 `"api": "openai-completions"` |
+| Gateway 后台进程被杀 | hdc shell 退出后子进程被 OH 回收 | 保持 hdc shell 前台运行 |
 
 ## 版本信息
 
@@ -254,6 +322,8 @@ V8、OpenSSL 3.5.5、libuv、zlib、brotli、zstd、sqlite、ICU、nghttp2、sim
 | V8 | 12.4.254.21-node.35 |
 | OpenSSL | 3.5.5（Node.js 内置） |
 | OH Clang | 15.0.4 |
+| OpenClaw | 2026.3.14 |
+| DeepSeek Model | deepseek-chat（openai-completions API） |
 | `process.platform` | `openharmony` |
 
 ## 与 Python 移植项目的关系

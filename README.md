@@ -12,66 +12,35 @@ OH RK3568 → Node.js 22.22.1 (V8 12.4 + OpenSSL 3.5.5)
 
 ## 快速部署（已有编译产物）
 
+仓库里有两个编译产物，直接推板子就能用，不需要重新编译：
+
+| 文件 | 大小 | 内容 |
+|:---|:---|:---|
+| `build/node-ohos` | 93MB | Node.js 22.22.1 交叉编译二进制 |
+| `build/openclaw-deploy.tar.gz` | 67MB | OpenClaw 构建产物 + Control UI + 运行时依赖（精简后） |
+
 ### 前提
 
 - 宿主机能通过 `hdc` 连接到 RK3568 开发板
 - 板子上有 `/data/local/tmp/`（14G+ 可用空间）
-- 宿主机有 Node.js 22+ 和 pnpm 10+（构建 OpenClaw 用）
 
 ### 步骤
 
 **1. 推 node 二进制到板子**
-
-`build/node-ohos`（93MB）是 strip 后的 Node.js 22.22.1（V8 + OpenSSL + libuv + ICU 全部静态链入，只依赖系统 libc.so 和 libc++.so）。
 
 ```bash
 hdc file send build/node-ohos /data/local/tmp/node
 hdc shell 'chmod +x /data/local/tmp/node'
 ```
 
-**2. 构建 OpenClaw（在宿主机上）**
+**2. 推 OpenClaw 部署包到板子**
 
 ```bash
-cd sources/openclaw
-pnpm install
-OPENCLAW_A2UI_SKIP_MISSING=1 pnpm build:docker   # 编译 TS → JS
-pnpm ui:build                                      # 编译 Control UI
-```
-
-**3. 打包部署到板子**
-
-```bash
-# 创建生产部署包
-pnpm deploy --filter openclaw --prod --legacy /tmp/openclaw-deploy
-
-# 删除 x86 native addon（板子是 aarch64 用不了）
-cd /tmp/openclaw-deploy/node_modules/.pnpm
-rm -rf @node-llama-cpp+linux-x64-* node-llama-cpp@* \
-  @napi-rs+canvas-linux-x64-* @img+sharp-libvips-linux-x64* \
-  koffi@* typescript@* pdfjs-dist@*
-
-# 打包
-cd /tmp/openclaw-deploy
-tar czf openclaw-deploy.tar.gz \
-  --exclude='*.d.ts' --exclude='*.map' --exclude='*.md' \
-  --exclude='LICENSE*' --exclude='__tests__' --exclude='test' \
-  openclaw.mjs package.json dist/ node_modules/
-
-# 推到板子
-hdc file send openclaw-deploy.tar.gz /data/local/tmp/openclaw-deploy.tar.gz
+hdc file send build/openclaw-deploy.tar.gz /data/local/tmp/openclaw-deploy.tar.gz
 hdc shell 'mkdir -p /data/local/tmp/openclaw && cd /data/local/tmp/openclaw && tar xzf /data/local/tmp/openclaw-deploy.tar.gz && rm /data/local/tmp/openclaw-deploy.tar.gz'
 ```
 
-**4. 补推模板文件（Agent 发消息需要）**
-
-```bash
-cd sources/openclaw
-tar czf /tmp/openclaw-templates.tar.gz docs/reference/templates/
-hdc file send /tmp/openclaw-templates.tar.gz /data/local/tmp/openclaw-templates.tar.gz
-hdc shell 'cd /data/local/tmp/openclaw && tar xzf /data/local/tmp/openclaw-templates.tar.gz && rm /data/local/tmp/openclaw-templates.tar.gz'
-```
-
-**5. 配置 DeepSeek API**
+**3. 配置 DeepSeek API**
 
 ```bash
 # 设模型
@@ -282,6 +251,65 @@ hdc file send $PROJ/build/node-ohos /data/local/tmp/node
 hdc shell 'chmod +x /data/local/tmp/node && LD_LIBRARY_PATH=/system/lib64 /data/local/tmp/node --version'
 # 输出：v22.22.1
 ```
+
+---
+
+## 从头构建 OpenClaw 部署包
+
+适用场景：想更新 OpenClaw 版本，或自定义依赖。
+
+### 前提
+
+- 宿主机有 Node.js 22+ 和 pnpm 10+
+- 已 clone OpenClaw 源码（`sources/openclaw/`）
+
+### Step 1: 安装依赖 + 构建
+
+```bash
+cd sources/openclaw
+pnpm install                                        # 安装依赖，约 40 秒
+OPENCLAW_A2UI_SKIP_MISSING=1 pnpm build:docker      # TS → JS（跳过 Canvas A2UI，板子不需要）
+pnpm ui:build                                       # 构建 Control UI 网页界面
+```
+
+### Step 2: 创建生产部署包
+
+```bash
+# pnpm deploy 提取生产依赖
+pnpm deploy --filter openclaw --prod --legacy /tmp/openclaw-deploy
+
+# 删除 x86 native addon（板子是 aarch64 用不了）
+cd /tmp/openclaw-deploy/node_modules/.pnpm
+rm -rf @node-llama-cpp+linux-x64-* node-llama-cpp@* \
+  @napi-rs+canvas-linux-x64-* @img+sharp-libvips-linux-x64* \
+  koffi@* typescript@* pdfjs-dist@*
+```
+
+### Step 3: 补入 Control UI 和模板文件
+
+```bash
+# Control UI（pnpm deploy 不包含 ui:build 产物）
+cp -r /path/to/sources/openclaw/dist/control-ui/ /tmp/openclaw-deploy/dist/control-ui/
+
+# Agent 模板文件（发消息时需要）
+mkdir -p /tmp/openclaw-deploy/docs/reference/
+cp -r /path/to/sources/openclaw/docs/reference/templates/ /tmp/openclaw-deploy/docs/reference/templates/
+```
+
+### Step 4: 打包
+
+```bash
+cd /tmp/openclaw-deploy
+tar czf openclaw-deploy.tar.gz \
+  --exclude='*.d.ts' --exclude='*.map' --exclude='*.ts' \
+  --exclude='*.md' --exclude='LICENSE*' --exclude='CHANGELOG*' \
+  --exclude='README*' --exclude='__tests__' --exclude='test' \
+  --exclude='tests' --exclude='.github' \
+  openclaw.mjs package.json dist/ docs/ node_modules/
+# 产物约 67MB
+```
+
+然后按"快速部署"的步骤推到板子。
 
 ---
 
